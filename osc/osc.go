@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"reflect"
 	"regexp"
@@ -20,6 +21,7 @@ const (
 	secondsFrom1900To1970  = 2208988800                      // Source: RFC 868
 	nanosecondsPerFraction = float64(0.23283064365386962891) // 1e9/(2^32)
 	bundleTagString        = "#bundle"
+	tcpType                = "tcp"
 )
 
 // Packet is the interface for Message and Bundle.
@@ -65,6 +67,89 @@ type Server struct {
 	Dispatcher  Dispatcher
 	ReadTimeout time.Duration
 	close       func() error
+}
+
+// TCP-variant OSC server. Can dial a connection and both listen for and
+// receive packets
+type TcpServer struct {
+	Dispatcher StandardDispatcher
+	Raddr      net.TCPAddr
+	Connection *net.TCPConn
+	close      func() error
+}
+
+func NewTcpServer(addr string, port string) (*TcpServer, error) {
+	radder, err := net.ResolveTCPAddr(tcpType, addr+":"+port)
+	if err != nil {
+		return nil, err
+	}
+	return &TcpServer{Dispatcher: *NewStandardDispatcher(), Raddr: *radder}, nil
+}
+
+func (t *TcpServer) Connect() error {
+	if t.Connection == nil {
+		con, err := net.DialTCP(tcpType, nil, &t.Raddr)
+		if err != nil {
+			return err
+		}
+		t.Connection = con
+	}
+	return nil
+}
+
+func (t *TcpServer) ServeForever() error {
+	if t.Connection == nil {
+		err := t.Connect()
+		if err != nil {
+			return err
+		}
+	}
+	for {
+		data := make([]byte, 4096)
+		n, err := t.Connection.Read(data)
+		if err != nil {
+			return err
+		}
+		msg, err := readTcp10(bufio.NewReader(bytes.NewBuffer(data[0:n])))
+		if err != nil {
+			return err
+		}
+		go t.Dispatcher.Dispatch(msg)
+	}
+}
+
+// TCP 1.0 uses "packet length headers" to delimit its packets
+// The length of the intended packet for reciept is attached as a 4 byte
+// header representing the remaining packet's byte length in int
+func readTcp10(reader *bufio.Reader) (Packet, error) {
+
+	// Make a 4 byte buffer for ourselves
+	header := make([]byte, 4)
+
+	// Read until that buffer is full
+	n, err := io.ReadFull(reader, header)
+	if n != 4 {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	// Make an empty int and read the bytes into it
+	var packlen int32
+	binary.Read(bytes.NewReader(header), binary.BigEndian, &packlen)
+
+	// Reade the rest of the packet, our actual OSC packet
+	packet := make([]byte, packlen)
+	_, err = io.ReadFull(reader, packet)
+	if err != nil {
+		return nil, err
+	}
+	p, err := readPacket(bufio.NewReader(bytes.NewBuffer(packet)))
+	if err != nil {
+		return nil, err
+	}
+	return p, nil
 }
 
 // Timetag represents an OSC Time Tag.
