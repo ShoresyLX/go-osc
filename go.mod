@@ -1,3 +1,3 @@
-module github.com/hypebeast/go-osc
+module github.com/ShoresyLX/go-osc
 
-go 1.16
+go 1.23

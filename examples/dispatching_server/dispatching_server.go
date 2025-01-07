@@ -1,12 +1,12 @@
 package main
 
-import "github.com/hypebeast/go-osc/osc"
+import "github.com/ShoresyLX/go-osc/osc"
 
 func main() {
-	addr := "127.0.0.1:8765"
+	addr := "127.0.0.1:9002"
 
 	d := osc.NewStandardDispatcher()
-	d.AddMsgHandler("/message/address", func(msg *osc.Message) {
+	d.AddMsgHandler("/eos/out/*", func(msg *osc.Message) {
 		osc.PrintMessage(msg)
 	})
 	server := &osc.Server{
