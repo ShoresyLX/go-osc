@@ -9,7 +9,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"reflect"
 	"regexp"
@@ -33,14 +32,14 @@ const (
 
 // OscTcpVer is the interface for OscTcp10 and OscTcp11
 type OscTcpVer interface {
-	Encode()
-	Decode()
-	Ver()
+	Encode([]byte) ([]byte, error)
+	Decode([]byte) (Packet, error)
+	Ver() string
 }
 
 type Encode func([]byte) ([]byte, error)
 
-type Decode func(*bufio.Reader) (Packet, error)
+type Decode func([]byte) (Packet, error)
 
 type Ver func() string
 
@@ -51,30 +50,13 @@ type OscTcp10 struct {
 // TCP 1.0 uses "packet length headers" to delimit its packets
 // The length of the intended packet for reciept is attached as a 4 byte
 // header representing the remaining packet's byte length in int
-func (o *OscTcp10) Decode(reader *bufio.Reader) (Packet, error) {
-	// Make a 4 byte buffer for ourselves
-	header := make([]byte, 4)
+func (o *OscTcp10) Decode(bpacket []byte) (Packet, error) {
 
-	// Read until that buffer is full
-	n, err := io.ReadFull(reader, header)
-	if n != 4 {
-		return nil, nil
+	plen := binary.BigEndian.Uint32(bpacket[:4])
+	if int(plen) != len(bpacket[4:]) {
+		return nil, fmt.Errorf("TCP 1.0 packet length not equal to header")
 	}
-	if err != nil {
-		return nil, err
-	}
-
-	// Make an empty int and read the bytes into it
-	var packlen int32
-	binary.Read(bytes.NewReader(header), binary.BigEndian, &packlen)
-
-	// Reade the rest of the packet, our actual OSC packet
-	packet := make([]byte, packlen)
-	_, err = io.ReadFull(reader, packet)
-	if err != nil {
-		return nil, err
-	}
-	p, err := readPacket(bufio.NewReader(bytes.NewBuffer(packet)))
+	p, err := readPacket(bufio.NewReader(bytes.NewBuffer(bpacket[4:])))
 	if err != nil {
 		return nil, err
 	}
@@ -83,13 +65,13 @@ func (o *OscTcp10) Decode(reader *bufio.Reader) (Packet, error) {
 
 // Adds the required 4 byte header to the packet containing the enclosed
 // content's length
-func (o *OscTcp10) Encode(packet []byte) ([]byte, error) {
+func (o *OscTcp10) Encode(bpacket []byte) ([]byte, error) {
 	newPack := make([]byte, 4)
-	binary.BigEndian.PutUint32(newPack[0:], uint32(len(packet)))
+	binary.BigEndian.PutUint32(newPack[0:], uint32(len(bpacket)))
 	if len(newPack) != 4 {
 		return nil, fmt.Errorf("Attempted TCP 1.0 encode created a head longer than 4")
 	}
-	return append(newPack, packet...), nil
+	return append(newPack, bpacket...), nil
 }
 
 func (o *OscTcp10) Ver() string {
@@ -110,6 +92,9 @@ func (o *OscTcp11) Ver() string {
 	return o.ver
 }
 
+// Decodes a raw OSC TCP 1.1 packet.
+// Takes a raw byte slice, returns a Packet struct and an error
+// if one is encountered
 func (o *OscTcp11) Decode(packet []byte) (Packet, error) {
 	if packet[len(packet)-1] != SlipEnd {
 		return nil, fmt.Errorf("Attempted TCP 1.1 Decode on a packet without END token")
@@ -120,6 +105,7 @@ func (o *OscTcp11) Decode(packet []byte) (Packet, error) {
 		endi := slices.Index(packet, SlipEnd)
 		if endi == len(packet)-1 {
 			packet = packet[:len(packet)-1]
+			break
 		}
 		var tp []byte
 		tp = append(tp, packet[:endi]...)
@@ -129,25 +115,34 @@ func (o *OscTcp11) Decode(packet []byte) (Packet, error) {
 	}
 
 	// Find any ESC tokens and replace them and their escapee with
-	// the appropriate byte
-	for i := 0; i < (len(packet) - 1); {
-		esci := slices.Index(packet[i:], SlipEsc)
-		var tp []byte
-		switch v := packet[esci+1]; v {
+	// the appropriate byte. We're replacing two bytes with one here.
+	if escTok := slices.Contains(packet, SlipEsc); escTok == true {
+		i := 0
+		var esci int
+		for escTok == true {
+			esci = slices.Index(packet[i:], SlipEsc)
+			if esci == (len(packet) - 1) {
+				return nil, fmt.Errorf("TCP 1.1 ESC token at end of packet, should not happen")
+			}
 
-		case SlipEscEnd:
-			tp = append(tp, packet[:esci]...)
-			tp = append(tp, SlipEnd)
-			tp = append(tp, packet[esci+2:]...)
-			packet = tp
+			var tp []byte
+			switch v := packet[esci+1]; v {
 
-		case SlipEscEsc:
-			tp = append(tp, packet[:esci]...)
-			tp = append(tp, SlipEsc)
-			tp = append(tp, packet[esci+2:]...)
-			packet = tp
+			case SlipEscEnd:
+				tp = append(tp, packet[:esci]...)
+				tp = append(tp, SlipEnd)
+				tp = append(tp, packet[esci+2:]...)
+				packet = tp
+
+			case SlipEscEsc:
+				tp = append(tp, packet[:esci]...)
+				tp = append(tp, SlipEsc)
+				tp = append(tp, packet[esci+2:]...)
+				packet = tp
+			}
+			i = esci + 1
+			escTok = slices.Contains(packet[i:], SlipEsc)
 		}
-		i = esci + 1
 	}
 
 	// Pass cleaned packet into packet reader for processing
@@ -156,7 +151,35 @@ func (o *OscTcp11) Decode(packet []byte) (Packet, error) {
 		return nil, err
 	}
 	return p, nil
+}
 
+// Takes in the marshalled binary for an OSC packet and encodes it
+// for sending via OSC TCP 1.1 spec
+func (o *OscTcp11) Encode(packet []byte) ([]byte, error) {
+	newPack := []byte{SlipEnd}
+	if escTok := slices.Contains(packet, SlipEsc); escTok == true {
+		var i int
+		var esci int
+		for escTok == true {
+			esci = slices.Index(packet[i:], SlipEsc)
+			packet = slices.Insert(packet, esci+1, SlipEscEsc)
+			i = esci + 2
+			escTok = slices.Contains(packet[i:], SlipEsc)
+		}
+	}
+	newPack = append(newPack, packet...)
+	if endTok := slices.Contains(newPack[1:], SlipEnd); endTok == true {
+		var i = 1
+		var endi int
+		for endTok == true {
+			endi = slices.Index(packet[i:], SlipEnd)
+			newPack = slices.Replace(newPack, endi, endi+1, SlipEsc)
+			newPack = slices.Insert(newPack, endi+1, SlipEscEnd)
+			i = endi + 2
+			endTok = slices.Contains(newPack[i:], SlipEnd)
+		}
+	}
+	return append(newPack, SlipEnd), nil
 }
 
 // Packet is the interface for Message and Bundle.
@@ -209,7 +232,7 @@ type Server struct {
 type TcpServer struct {
 	Dispatcher StandardDispatcher
 	Raddr      net.TCPAddr
-	OscVer     string
+	TcpVer     OscTcpVer
 	Connection *net.TCPConn
 	close      func() error
 }
@@ -218,10 +241,18 @@ type TcpServer struct {
 // oscTcpVer should be one of two defined constants, either osc.TCP10 or osc.TCP11
 func NewTcpServer(addr string, oscTcpVer string) (*TcpServer, error) {
 	radder, err := net.ResolveTCPAddr(tcpType, addr)
+	var tcpVer OscTcpVer
+	if oscTcpVer == "1.0" {
+		tcpVer = &OscTcp10{}
+	} else if oscTcpVer == "1.1" {
+		tcpVer = &OscTcp11{}
+	} else {
+		return nil, fmt.Errorf("Invalid TCP type string")
+	}
 	if err != nil {
 		return nil, err
 	}
-	return &TcpServer{Dispatcher: *NewStandardDispatcher(), OscVer: oscTcpVer, Raddr: *radder}, nil
+	return &TcpServer{Dispatcher: *NewStandardDispatcher(), TcpVer: tcpVer, Raddr: *radder}, nil
 }
 
 func (t *TcpServer) Connect() error {
@@ -243,17 +274,52 @@ func (t *TcpServer) ServeForever() error {
 		}
 	}
 	for {
-		data := make([]byte, 4096)
-		n, err := t.Connection.Read(data)
+		p, err := t.Receive()
 		if err != nil {
 			return err
 		}
-		msg, err := readTcp10(bufio.NewReader(bytes.NewBuffer(data[0:n])))
-		if err != nil {
-			return err
-		}
-		go t.Dispatcher.Dispatch(msg)
+		go t.Dispatcher.Dispatch(p)
 	}
+}
+
+func (t *TcpServer) SendPacket(packet Packet) error {
+	if t.Connection == nil {
+		err := t.Connect()
+		if err != nil {
+			return err
+		}
+	}
+	data, err := packet.MarshalBinary()
+	if err != nil {
+		return err
+	}
+	tdata, err := t.TcpVer.Encode(data)
+	if err != nil {
+		return err
+	}
+	_, err = t.Connection.Write(tdata)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+func (t *TcpServer) Receive() (Packet, error) {
+	if t.Connection == nil {
+		err := t.Connect()
+		if err != nil {
+			return nil, err
+		}
+	}
+	data := make([]byte, 4096)
+	_, err := t.Connection.Read(data)
+	if err != nil {
+		return nil, err
+	}
+	msg, err := t.TcpVer.Decode(data)
+	if err != nil {
+		return nil, err
+	}
+	return msg, nil
 }
 
 // Timetag represents an OSC Time Tag.
